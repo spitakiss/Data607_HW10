@@ -1,0 +1,356 @@
+---
+title: 'Wk 10: Spam/Ham Classification'
+author: "Aaron Grzasko"
+date: "November 6, 2016"
+output: 
+    html_document:
+        theme: simplex
+        highlight: haddock
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment=NA, warning=FALSE, message=FALSE)
+```
+
+## Assignment Overview  
+  
+The objective of this assignment is to build a binary classifier model to determine whether an email is "spam" or "not spam".  
+This exercise also incorporates many of the data cleansing techniques we've been covering throughout the semester, including regex and html scraping methods.    
+  
+---  
+
+## Data  
+  
+The raw data for this assignment can be found at [spamassassin.apache.org](https://spamassassin.apache.org/publiccorpus/).  
+  
+I chose the following spam and ham data sets from the apache.org site for my analysis:  
+  
+* *20030228_spam_2.tar.bz2*  
+* *20021010_spam.tar.bz2*  
+  
+The raw data is available on my [Github repo](), along with the R Markdown document.   
+  
+---  
+  
+## Resources  
+  
+The data wrangling methods employed in this exercise are an amalgamation of the techniques already covered in previous readings and exercises.  However, the building of the classifier models draws significantly on the outlined procedures in Chapter 10 of *Automated Data Collection with R*, with particular emphasis on pages 310-312.  Here is the full citation:  
+
+Munzert, Simon et al. "Chapter 10: Statistical Text Processing." *Automated Data Collection with R: a Practical Guide to Web Scraping and Text Mining*, 1st ed., John Wiley & Sons Ltd., Chichester, UK, 2015, pp. 295-321.
+  
+---  
+
+## Libraries
+  
+```{r}
+if (!require(stringr)) install.packages('stringr')
+if (!require(tm.plugin.webmining)) install.packages('tm.plugin.webmining')
+if (!require(tm)) install.packages('tm')
+if (!require(SnowballC)) install.packages('SnowballC')
+if (!require(RTextTools)) install.packages('RTextTools')
+if (!require(R.utils)) install.packages('R.utils')
+if (!require(utils)) install.packages('utils')
+```
+  
+---  
+
+## File Download, Unzip, and Create File List 
+  
+**Download and Unzip**  
+Download the raw zip files from Github.  Then unzip the .bz2 and .tar files using functions from the `R.Utils` and `utils` packages, respectively.  
+
+```{r, eval=FALSE}
+# download and unzip spam document from github 
+download.file('https://raw.githubusercontent.com/spitakiss/Data607_HW10/master/20021010_spam.tar.bz2', destfile="spam_zip.tar.bz2")
+bunzip2("spam_zip.tar.bz2", remove = F, overwrite = T)
+untar("spam_zip.tar") #creates spam folder
+
+# download and unzip spam document from github 
+download.file('https://raw.githubusercontent.com/spitakiss/Data607_HW10/master/20030228_easy_ham_2.tar.bz2', destfile="ham_zip.tar.bz2")
+bunzip2("ham_zip.tar.bz2", remove = F, overwrite = T)
+untar("ham_zip.tar") #creates easy_ham_2 folder
+```
+  
+**Remove Unnecessary Files**  
+Now we have two folders with ham and spam emails.  However, there is an extraneous file in both folders that provides a content listing of the other emails in the given folder.  Let's delete these files:  
+  
+```{r, eval=FALSE, echo=TRUE}
+# identify extraneous ham file and delete
+remove_ham <- list.files(path="easy_ham_2/", full.names=T, recursive=FALSE, pattern="cmds")
+file.remove(remove_ham)
+
+# identify extraneous spam file and delete
+remove_spam <-list.files(path="spam/", full.names=T, recursive=FALSE, pattern="0000.7b1b73cf36cf9dbc3d64e3f2ee2b91f1")
+file.remove(remove_spam)
+
+```
+  
+**File List and Name Shuffle**  
+We'll now create an object, `ham_spam`, that lists all email file names, regardless of whether the email is actually spam or ham.  
+Then we will shuffle the order of the files.  This last step is important later in the analysis when we allocate the emails between the  the training and test data sets.   
+
+```{r}
+# list of spam files
+spam_files <-list.files(path="spam/", full.names=T, recursive=FALSE)
+
+# list of ham files
+ham_files <- list.files(path="easy_ham_2/",full.names=T, recursive=FALSE)
+
+# concatenate ham and spam file lists
+ham_spam <- c(ham_files,spam_files)
+
+#shuffle file names
+set.seed(2020)
+ham_spam <- sample(ham_spam,length(ham_spam))
+
+head(ham_spam,15)
+
+```
+  
+---  
+  
+## Clean Email Text  
+  
+**Raw Email Example**  
+Here is an example of an email, before any data scrubbing has taken place: 
+
+```{r}
+# head of 1st email
+head(readLines(ham_spam[1]),10)
+
+# tail of 1st email
+tail(readLines(ham_spam[1]),15)
+```
+  
+  
+**Cleaning Scripts**  
+Now, let's do some preliminary scrubbing:  
+
+```{r}
+
+# function to find first blank line in email.
+# using this function to estimate where email body begins.
+find_blank_line <-function(x){
+    for (i in 1:length(x)){
+        if (str_detect(x[i],"^[:space:]*$")){
+            result <- i
+            return(i) 
+        }
+    }
+}
+
+# set up variables for loop
+n <- 0
+if(exists('email_corpus')){rm(email_corpus)} 
+
+# loop through each email
+for (i in 1:length(ham_spam)){
+    tmp <- readLines(ham_spam[i])
+    
+    # remove email header
+    beg <- find_blank_line(tmp)+1
+    end <- length(tmp)
+    tmp <- tmp[beg:end]
+    
+    # remove HTML tags
+    if(extractHTMLStrip(tmp)!=""){
+        tmp <- extractHTMLStrip(tmp)
+    }
+    
+    # remove URL links, punctuation, numbers, newlines, and misc symbols
+    tmp <- unlist(str_replace_all(tmp,"[[:punct:]]|[[:digit:]]|http\\S+\\s*|\\n|<|>|=|_|-|#|\\$|\\|"," "))
+    
+    # remove extra whitespace
+    tmp <- str_trim(unlist(str_replace_all(tmp,"\\s+"," ")))                           
+    
+    tmp <- str_c(tmp,collapse="")
+    
+    # Add emails to corpus, and include spam/ham category information
+    if (length(tmp)!=0){
+        n <- n + 1
+        tmp_corpus <- Corpus(VectorSource(tmp))
+        ifelse(!exists('email_corpus'), email_corpus <- tmp_corpus, email_corpus <- c(email_corpus,tmp_corpus))
+        meta(email_corpus[[n]], "spam_ham") <- ifelse(str_detect(ham_spam[i],"spam"),1,0)
+        
+    }
+}    
+```
+  
+
+**Scrubbed Email Example**  
+Let's take a look at the email example from earlier in this section, but in post-scrub form:  
+
+```{r}
+# example scrubbed 1st email
+email_corpus[[1]][1]
+```
+  
+---  
+  
+## Corpus Scubbing  
+  
+**Initial DTM**  
+Let's take a first look at the document term matrix, based on the scrubbing work performed so far:  
+  
+```{r}
+dtm <- DocumentTermMatrix(email_corpus)
+dtm
+
+```
+  
+**Intermediate DTM**  
+We see that the resulting matrix is extremely sparse, and we have at least one term with a length of 161.  We'll now perform additional scrubbing work:  
+
+```{r}
+# transform all words in corpus to lower case
+email_corpus_mod <- tm_map(email_corpus, content_transformer(tolower))
+
+# remove all stop words (e.g. "i", "me", "she", etc.)
+email_corpus_mod <- tm_map(email_corpus_mod,removeWords, words = stopwords("en"))
+
+# stem words: cut certain terms down to word root
+email_corpus_mod <- tm_map(email_corpus_mod, stemDocument)
+
+```
+  
+Let's looks at at the dtm statistics, in light of the previous transformations:  
+```{r}
+dtm <- DocumentTermMatrix(email_corpus_mod)
+dtm
+```
+  
+We cut down on the number of sparse terms, but total sparsity is still rounding to 100%.  We also note that the maximum term length has not changed.  
+  
+**Final DTM**  
+  
+We now remove any terms that are not present in at least 10 documents:  
+
+```{r}
+dtm <- removeSparseTerms(dtm,1-(10/length(email_corpus_mod)))
+dtm
+```
+  
+This last step made had a significant impact:  
+  
+* sparsity has decreased to 97%
+* maximum term length is now 15, down from 161.  
+  
+---  
+  
+## Classifier Models  
+  
+**Spam Labels**  
+  
+We'll first create a vector of labels to indicate whether an email was a spam or not.  We're using a value of 1 to indicate spam, and a value of 0 to indicate not spam (i.e. ham).  
+  
+```{r}
+# create spam label vector for each email which indiciates actual status of "spam" or "not spam" 
+
+spam_labels_prelim <- unlist(meta(email_corpus_mod,"spam_ham"))
+
+spam_labels <- c(rep(NA,length(email_corpus_mod)))
+
+for (i in 1:length(email_corpus_mod)){
+     spam_labels[i] <- spam_labels_prelim[[i]]
+}
+```
+  
+**Set Up Models**  
+  
+Here we set up three supervised classifier models for our spam/ham problem:  
+  
+* SVM:  support vector machines  
+* TREE:  random forest  
+* MAXENT:  maximum entropy  
+  
+In keeping with common practice, we allocated 80% of the corpus to the training data set, and 20% to the test set. Because we randomly shuffled the combined, spam/ham file name order order of the emails in an earlier step, we're simply allocating the first 1,536 emails to the training set, and the remainder to the test set.  
+  
+
+```{r}  
+# number of emails in corpus
+N <- length(spam_labels)
+
+# set up model container; 80/20 split between train and test data
+container <- create_container(
+    dtm,
+    labels = spam_labels,
+    trainSize = 1:(0.8*N),
+    testSize = (0.8*N+1):N,
+    virgin = FALSE
+)
+
+svm_model <- train_model(container, "SVM")
+tree_model <- train_model(container, "TREE")
+maxent_model <- train_model(container, "MAXENT")
+
+svm_out <- classify_model(container, svm_model)
+tree_out <- classify_model(container, tree_model)
+maxent_out <- classify_model(container, maxent_model)
+
+```
+  
+**Model Output**  
+  
+Below is example output from the three models.  
+  
+The first column represents the given model's estimated category classification--that is, spam or not spam.  The next column is an estimate of the probability of the suggested classification.  
+  
+
+```{r}
+head(svm_out,5)
+head(tree_out,5)
+head(maxent_out,5)
+
+```
+  
+**Model Performance**  
+
+Finally, let's let's examine the accuracy of the three models.  We'll calculate the percentage of emails correctly categorized by each model, using the smaller test data set.   
+  
+```{r}
+# create lables:  actual classification, then model classification
+# for three models on test data
+
+labels_out <- data.frame(
+    correct_label = spam_labels[(0.8*N+1):N],
+    svm = as.character(svm_out[,1]),
+    tree = as.character(tree_out[,1]),
+    maxent = as.character(maxent_out[,1]),
+    stringAsFactors = F)
+
+
+#SVM Performance
+svm_table <- table(labels_out[,1] == labels_out[,2])
+addmargins(svm_table)
+svm_table
+round(prop.table(svm_table),3)
+
+#RF Peformance
+rf_table <- table(labels_out[,1] == labels_out[,3])
+addmargins(rf_table)
+round(prop.table(rf_table),3)
+
+#ME Performance
+
+me_table <- table(labels_out[,1] == labels_out[,4])
+addmargins(me_table)
+round(prop.table(me_table),3)
+
+```
+  
+**Final Thoughts**  
+
+We see that that both the SVM and ME models performed equally well:  both models classified 375 out of the 380 test emails correct (98.7% accuracy.)  
+  
+The random forest model, unfortunately, did not perform nearly as well.  It correctly classified 347 out of the 380 test email (91.3% accuracy).  
+  
+Based on this admittedly limited analysis, I recommend using either the SVM or ME models on future email test data sets.   
+  
+
+
+  
+
+
+  
+
+
